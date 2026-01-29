@@ -1,0 +1,105 @@
+<?php
+ini_set('display_errors', 0);
+error_reporting(E_ERROR | E_PARSE);
+
+require 'vendor/autoload.php';
+
+use GuzzleHttp\Client;
+use GuzzleHttp\Exception\RequestException;
+
+$env = parse_ini_file('.env');
+$openai_api_key = $env['OPENAI_KEY'];
+$tavily_api_key = $env['TAVILY_KEY'];
+$google_search_engine_id = $env['GOOGLE_SERCH_ENGINE_ID'];
+$google_search_api_key = $env['GOOGLE_SERCH_API_KEY'];
+$perplexity_search_api_key = $env['PERPLEXITY_SERCH_API_KEY'];
+
+$client = new Client();
+$tavily_client = new Client();
+
+global $final_message;
+global $final_image;
+global $error_message;
+global $prompt_date;
+global $prompt_search_engine;
+
+$assistant_prompt_instruction = $_POST['writer_instruction'];
+$replacedPrompt = $_POST['writer_agent_main'];
+
+function wait_for_run_completion($thread_id, $run_id) {
+    global $client, $openai_api_key, $error_message;
+    $i = 0;
+    while (true) {
+        if ($i > 30) {
+            break;
+        }
+        $i++;
+        sleep(1);
+        try {
+            $response = $client->request('GET', "https://api.openai.com/v1/threads/$thread_id/runs/$run_id", [
+                'headers' => [
+                    'Authorization' => 'Bearer ' . $openai_api_key,
+                    'OpenAI-Beta' => 'assistants=v2'
+                ]
+            ]);
+            $run = json_decode($response->getBody(), true);
+            if (in_array($run['status'], ['completed', 'failed', 'requires_action'])) {
+                return $run;
+            }
+        } catch (RequestException $e) {
+            $error_message = $e->getMessage();
+            return null;
+        }
+    }
+}
+
+function print_messages_from_thread($thread_id) {
+    global $client, $openai_api_key, $final_message, $error_message;
+    try {
+        $response = $client->request('GET', "https://api.openai.com/v1/threads/$thread_id/messages", [
+            'headers' => [
+                'Authorization' => 'Bearer ' . $openai_api_key,
+                'OpenAI-Beta' => 'assistants=v2'
+            ]
+        ]);
+        $messages = json_decode($response->getBody(), true);
+        $final_message = $messages['data'][0]['content'][0]['text']['value'];
+    } catch (RequestException $e) {
+        $error_message = $e->getMessage();
+    }
+}
+
+function get_string_between($string, $start, $end) {
+    $string = ' ' . $string;
+    $ini = strpos($string, $start);
+    if ($ini == 0) return '';
+    $ini += strlen($start);
+    $len = strpos($string, $end, $ini) - $ini;
+    return substr($string, $ini, $len);
+}
+
+try {
+    switch ($prompt_search_engine) {
+        case 'google_search':
+            $function_name = 'search_engine_gg';
+            break;
+        case 'tavily_search':
+            $function_name = 'search_engine_tv';
+            break;
+        case 'perplexity_search':
+            $function_name = 'search_engine_perplexity';
+            break;
+        default:
+            $function_name = 'search_engine_gg';
+    }
+
+    $response = $client->request('POST', 'https://api.openai.com/v1/assistants', [
+        'headers' => [
+            'Authorization' => 'Bearer ' . $openai_api_key,
+            'Content-Type' => 'application/json',
+            'OpenAI-Beta' => 'assistants=v2'
+        ],
+        'json' => [
+            'instructions' => $assistant_prompt_instruction,
+            'model' => 'gpt-4o-mini',
+            'temperature' => 0.
