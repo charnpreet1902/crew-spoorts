@@ -1,0 +1,640 @@
+<?php
+date_default_timezone_set('UTC');
+
+if (isset($_POST['kill_request'])) {
+    flush();
+    ob_flush();
+}
+
+ini_set('max_execution_time', 10);
+ignore_user_abort(true);
+
+require 'db.php';
+require 'vendor/autoload.php';
+require 'upload_image.php';
+
+use Aws\S3\S3Client;
+use Aws\Exception\AwsException;
+
+$env = parse_ini_file('.env');
+$serpapi_key = $env['SERPAPI_KEY'];
+$s3_key = $env['AMAZON_S3_KEY'];
+$s3_secret_key = $env['AMAZON_S3_SECRET_KEY'];
+$s3_region = $env['AMAZON_S3_REGION'];
+$s3_bucket = $env['AMAZON_S3_BUCKET'];
+$tavily_key = $env['TAVILY_KEY'];
+$google_search_engine_id = $env['GOOGLE_SERCH_ENGINE_ID'];
+$google_search_api_key = $env['GOOGLE_SERCH_API_KEY'];
+$perplexity_search_api_key = $env['PERPLEXITY_SERCH_API_KEY'];
+$serper_api_key = $env['SERPER_API_KEY'];
+
+global $country, $city, $city_country, $language, $prompt_date, $prompt_sort_by, $prompt_since, $prompt_search_engine, $prompt_site_filter, $prompt_or_terms, $prompt_exact_terms, $prompt_google_domain, $prompt_search_topic, $prompt_days_backup, $perplexity_models;
+
+session_start();
+$valid_prommpt = true;
+$data = [];
+
+$result = $conn->query("SELECT name, value FROM Wo_Config WHERE name IN ('cron_play_pause','cron_all_schedule','schedule_start','schedule_end','prompt_execution_number','prompt_matching_result','enable_wakalaai_search','enable_wakalaai_writer')");
+
+while ($sql_fetch = $result->fetch_assoc()) {
+    if ($sql_fetch['name'] == 'cron_play_pause') {
+        $cron_play_pause = $sql_fetch['value'];
+    }
+    if ($sql_fetch['name'] == 'cron_all_schedule') {
+        $cron_all_schedule = $sql_fetch['value'];
+    }
+    if ($sql_fetch['name'] == 'schedule_start') {
+        $schedule_start = $sql_fetch['value'];
+    }
+    if ($sql_fetch['name'] == 'schedule_end') {
+        $schedule_end = $sql_fetch['value'];
+    }
+    if ($sql_fetch['name'] == 'prompt_execution_number') {
+        $prompt_execution_number = $sql_fetch['value'];
+    }
+    if ($sql_fetch['name'] == 'prompt_matching_result') {
+        $prompt_matching_result = $sql_fetch['value'];
+    }
+    if ($sql_fetch['name'] == 'enable_wakalaai_search') {
+        $enable_wakalaai_search = $sql_fetch['value'];
+    }
+    if ($sql_fetch['name'] == 'enable_wakalaai_writer') {
+        $enable_wakalaai_writer = $sql_fetch['value'];
+    }
+}
+
+if ($cron_play_pause == 'pause') {
+    $valid_prommpt = false;
+}
+
+if ($cron_all_schedule == 'schedule_play') {
+    if (empty($schedule_start) || empty($schedule_end)) {
+        $valid_prommpt = false;
+    } else {
+        $current_time = date('H:i:s a');
+        $date1 = DateTime::createFromFormat('h:i:s a', $current_time);
+        $date2 = DateTime::createFromFormat('h:i:s a', $schedule_start);
+        $date3 = DateTime::createFromFormat('h:i:s a', $schedule_end);
+        
+        if (!($date1 > $date2 && $date1 < $date3)) {
+            echo $current_time . ' ' . $schedule_start . ' ' . $schedule_end . '<br>';
+            $valid_prommpt = false;
+        }
+    }
+}
+
+$conn->query("DELETE FROM Wo_AI_Prompts_execution WHERE pending_date_time <= UNIX_TIMESTAMP(CURDATE())");
+
+if ($valid_prommpt) {
+    $i = 0;
+    $execution_ids = [];
+    $result_already_executed = $conn->query("SELECT * FROM Wo_AI_Automation_Prompts WHERE paused=0 AND cron_automation = 0");
+    
+    while ($sql_fetch_exec = $result_already_executed->fetch_assoc()) {
+        $prompt_id = $sql_fetch_exec['id'];
+        $last_executed_on = $sql_fetch_exec['time'];
+        $last_executed_time = date('H:i:s', $last_executed_on);
+        $frequency = $sql_fetch_exec['frequency'];
+        $frequency_value = $sql_fetch_exec['frequency_value'];
+        $current_time = time();
+        $today_date = date('d-m-Y');
+        $today_start = strtotime($today_date . ' 00:00:00');
+        $today_end = strtotime($today_date . ' 23:59:59');
+        $execution_date = strtotime(date('Y-m-d', $last_executed_on));
+        $today = strtotime(date('Y-m-d'));
+
+        if (empty($sql_fetch_exec['time']) || $sql_fetch_exec['time'] == NULL) {
+            $execution_ids[$prompt_id] = 0;
+        } else {
+            if ($frequency == 'minutes') {
+                $seconds = $frequency_value * 60;
+                $expected_time = strtotime($last_executed_time) + $seconds;
+                if ($execution_date < $today) {
+                    $d = date('d-m-Y');
+                    $t = date('H:i:s', $expected_time);
+                    $expected_time = strtotime($d . ' ' . $t);
+                }
+                $pending_time = $expected_time - time();
+                if ($expected_time >= $today_start && $expected_time <= $today_end) {
+                    $execution_ids[$prompt_id] = $pending_time;
+                }
+            } else if ($frequency == 'hours') {
+                $seconds = $frequency_value * 3600;
+                $expected_time = strtotime($last_executed_time) + $seconds;
+                if ($execution_date < $today) {
+                    $d = date('d-m-Y');
+                    $t = date('H:i:s', $expected_time);
+                    $expected_time = strtotime($d . ' ' . $t);
+                }
+                $pending_time = $expected_time - time();
+                if ($expected_time >= $today_start && $expected_time <= $today_end) {
+                    $execution_ids[$prompt_id] = $pending_time;
+                }
+            } else if ($frequency == 'days') {
+                $Date = date('d M Y H:i:s', $last_executed_on);
+                $expected_time = strtotime(date('d M Y H:i:s', strtotime($Date . ' + ' . $frequency_value . ' days')));
+                $next_execution_date = date('d-m-Y', $expected_time);
+                if (strtotime($next_execution_date) < $today) {
+                    $d = date('d-m-Y');
+                    $t = $last_executed_time;
+                    $expected_time = strtotime($d . ' ' . $t);
+                }
+                $pending_time = $expected_time - time();
+                if ($expected_time >= $today_start && $expected_time <= $today_end) {
+                    $execution_ids[$prompt_id] = $pending_time;
+                }
+            } else if ($frequency == 'months') {
+                $Date = date('d M Y H:i:s', $last_executed_on);
+                $expected_time = strtotime(date('d M Y H:i:s', strtotime($Date . ' + ' . $frequency_value . ' months')));
+                $next_execution_date = date('d-m-Y', $expected_time);
+                $pending_time = $expected_time - time();
+                if (strtotime($next_execution_date) < $today) {
+                    $d = date('d-m-Y');
+                    $t = $last_executed_time;
+                    $expected_time = strtotime($d . ' ' . $t);
+                }
+                if ($expected_time >= $today_start && $expected_time <= $today_end) {
+                    $execution_ids[$prompt_id] = $pending_time;
+                }
+            }
+        }
+        $i++;
+    }
+
+    asort($execution_ids);
+    $execution_arr = [];
+    $i = 0;
+
+    foreach ($execution_ids as $key => $value) {
+        if ($i < $prompt_execution_number) {
+            $execution_arr[$i]['prompt_id'] = $key;
+            $execution_arr[$i]['pending_date_time'] = $value;
+        }
+        $i++;
+    }
+
+    if (empty($execution_arr)) {
+        $data['message'] = 'No result found 1';
+        $data['message_type'] = "danger";
+        echo json_encode($data, true);
+        die;
+    }
+
+    foreach ($execution_arr as $execution_key => $execution_value) {
+        $id = $execution_value['prompt_id'];
+        echo 'prompt id' . $id . '<br>';
+        $valid_prommpt = true;
+        
+        $result = $conn->query("SELECT * FROM Wo_AI_Automation_Prompts WHERE id = $id");
+        $prompt = $result->fetch_assoc();
+
+        if ($prompt['paused']) {
+            echo 'Paused';
+            continue;
+        }
+
+        $result2 = $conn->query("SELECT * FROM Wo_AI_Prompts_Template WHERE id = 1");
+        $template = $result2->fetch_assoc();
+        $ai_instruction_tones = json_decode($template['ai_instruction_tones'], true);
+        $ai_writing_models = json_decode($template['ai_writing_models'], true);
+
+        $success = true;
+        $errors = [];
+
+        if ($prompt) {
+            $user_id_arr = json_decode($prompt['user_id'], true);
+            $user_id = $user_id_arr[array_rand($user_id_arr, 1)];
+            $category_arr = json_decode($prompt['category'], true);
+            $category = $category_arr[array_rand($category_arr, 1)];
+            $category_name_eng = getWordLangByLang($category);
+
+            $lang_country_city = json_decode($prompt['lang_country_city'], true);
+            $lang_country_city_key = array_rand($lang_country_city);
+            $lang_country_city_value = $lang_country_city[$lang_country_city_key];
+            $language = trim($lang_country_city_key);
+
+            $city_country = $lang_country_city_value;
+            $city = array_rand($city_country, 1);
+            $country = trim(base64_decode($city_country[$city]));
+            $city = base64_decode($city);
+
+            $prompt_date = $prompt['date'];
+            $prompt_sort_by = $prompt['sort_by'];
+            $prompt_since = $prompt['since'];
+            $prompt_search_engine = $prompt['search_engine'];
+            $prompt_site_filter = $prompt['site_filter'];
+            $prompt_or_terms = $prompt['or_terms'];
+            $prompt_exact_terms = $prompt['exact_terms'];
+            $prompt_google_domain = $prompt['google_domain'];
+            $prompt_search_topic = $prompt['search_topic'];
+            $prompt_days_backup = $prompt['days_backup'];
+            $perplexity_models = $prompt['perplexity_models'];
+            $search_keyword = $prompt['search_keyword'];
+            $type_post = $prompt['type_post'];
+            $llm_writer = $prompt['llm_writer'];
+            $llm_model = $prompt['llm_model'];
+
+            $link = '';
+            if (!empty($prompt['link_topic'])) {
+                $link_arr = json_decode($prompt['link_topic'], true);
+                $link = $link_arr[array_rand($link_arr, 1)];
+            }
+
+            $topic_name = base64_decode($prompt['topic_name']);
+            $frequency = $prompt['frequency'];
+            $frequency_value = $prompt['frequency_value'];
+            $image_search_type = !empty($prompt['image_search_type']) ? $prompt['image_search_type'] : 'by_title';
+            $vaild = true;
+
+            $tone_instruction = 'You are a sports journalist and write a sports article. You must Keep the text `Title:`, `Description:` and `Hashtags:` in English.';
+            if (!empty($ai_instruction_tones)) {
+                foreach ($ai_instruction_tones as $tone) {
+                    foreach ($tone as $title => $desc) {
+                        if ($title == $prompt['tone_instruction']) {
+                            $tone_instruction = $desc;
+                        }
+                    }
+                }
+            }
+
+            $writing_model = '';
+            if (!empty($ai_writing_models) && $prompt['use_writing_model'] == '1') {
+                foreach ($ai_writing_models as $model) {
+                    foreach ($model as $title => $desc) {
+                        if ($title == $prompt['writing_model']) {
+                            $writing_model = $desc;
+                        }
+                    }
+                }
+            }
+            $prompt['prompt'] = $prompt['prompt'] . '<br>' . $writing_model;
+
+            if ($prompt['time'] > 0) {
+                $last_executed_on = $prompt['time'];
+                $current_time = time();
+                $last_executed_time = date('H:i:s', $last_executed_on);
+                $execution_date = strtotime(date('Y-m-d', $last_executed_on));
+                $today = strtotime(date('Y-m-d'));
+
+                if ($frequency == 'minutes') {
+                    $seconds = $frequency_value * 60;
+                    $expected_time = $last_executed_on + $seconds;
+                    if ($execution_date < $today) {
+                        $d = date('d-m-Y');
+                        $t = date('H:i:s', $expected_time);
+                        $expected_time = strtotime($d . ' ' . $t);
+                    }
+                    if ($current_time < $expected_time) {
+                        $valid_prommpt = false;
+                    }
+                } else if ($frequency == 'hours') {
+                    $seconds = $frequency_value * 3600;
+                    $expected_time = $last_executed_on + $seconds;
+                    if ($execution_date < $today) {
+                        $d = date('d-m-Y');
+                        $t = date('H:i:s', $expected_time);
+                        $expected_time = strtotime($d . ' ' . $t);
+                    }
+                    if ($current_time < $expected_time) {
+                        $valid_prommpt = false;
+                    }
+                } else if ($frequency == 'days') {
+                    $Date = date('d M Y H:i:s', $last_executed_on);
+                    $expected_time = strtotime(date('d M Y H:i:s', strtotime($Date . ' + ' . $frequency_value . ' days')));
+                    $next_execution_date = date('d-m-Y', $expected_time);
+                    if (strtotime($next_execution_date) < $today) {
+                        $d = date('d-m-Y');
+                        $t = $last_executed_time;
+                        $expected_time = strtotime($d . ' ' . $t);
+                    }
+                    if ($current_time < $expected_time) {
+                        $valid_prommpt = false;
+                    }
+                } else if ($frequency == 'months') {
+                    $Date = date('d M Y H:i:s', $last_executed_on);
+                    $expected_time = strtotime(date('d M Y H:i:s', strtotime($Date . ' + ' . $frequency_value . ' months')));
+                    $next_execution_date = date('d-m-Y', $expected_time);
+                    if (strtotime($next_execution_date) < $today) {
+                        $d = date('d-m-Y');
+                        $t = $last_executed_time;
+                        $expected_time = strtotime($d . ' ' . $t);
+                    }
+                    if ($current_time < $expected_time) {
+                        $valid_prommpt = false;
+                    }
+                }
+            }
+
+            $callback = function ($matches) use ($category, $country, $city, $language, $link, $topic_name) {
+                switch (strtolower($matches[1])) {
+                    case 'category': return $category;
+                    case 'country': return $country;
+                    case 'city': return $city;
+                    case 'language': return $language;
+                    case 'link': return $link;
+                    case 'topic_name': return $topic_name;
+                    default: return $matches[0];
+                }
+            };
+
+            $replacedPrompt = preg_replace_callback('/#(Category|Country|City|Language|Link|topic_name)/i', $callback, $prompt['prompt']);
+
+            if ($prompt['use_search_template'] == '0') {
+                $search_agent_intro = $prompt['customize_search_template'];
+            } else {
+                if ($prompt['search_agent_template'] == '0') {
+                    $search_agent_intro = !empty($prompt['prompt_link_topic']) ? $template['topic_link_search_main'] : $template['topic_name_search_main'];
+                } else {
+                    $search_agent_intro = !empty($prompt['prompt_link_topic']) ? $template['topic_link_search_global_main'] : $template['topic_name_search_global_main'];
+                }
+            }
+            $search_agent_intro = preg_replace_callback('/#(Category|Country|City|Language|Link|topic_name)/i', $callback, $search_agent_intro);
+
+            $backward = '';
+            if ($prompt['frequency'] == 'hours' && $prompt['frequency_value'] >= 6) {
+                $hour = (int)$prompt['frequency_value'] / 2;
+                $backward = "or {$hour} hours backward";
+            }
+            $search_agent_intro = str_replace('#BACKWARD', $backward, $search_agent_intro);
+
+            if ($prompt['use_search_template'] == '0') {
+                $search_agent_wakalaai_intro = $prompt['customize_search_template'];
+            } else {
+                if ($prompt['search_agent_template'] == '0') {
+                    $search_agent_wakalaai_intro = !empty($prompt['link_topic']) && $prompt['link_topic'] != '[""]' ? $template['topic_link_search_wakalaai_main'] : $template['topic_name_search_wakalaai_main'];
+                } else {
+                    $search_agent_wakalaai_intro = !empty($prompt['link_topic']) && $prompt['link_topic'] != '[""]' ? $template['topic_link_search_wakalaai_global_main'] : $template['topic_name_search_wakalaai_global_main'];
+                }
+            }
+
+            $wakalaai_callback = function ($matches) use ($category_name_eng, $country, $city, $language, $link, $topic_name) {
+                switch (strtolower($matches[1])) {
+                    case 'category': return $category_name_eng;
+                    case 'country': return $country;
+                    case 'city': return $city;
+                    case 'language': return $language;
+                    case 'link': return $link;
+                    case 'topic_name': return $topic_name;
+                    default: return $matches[0];
+                }
+            };
+            $search_agent_wakalaai_intro = preg_replace_callback('/#(Category|Country|City|Language|Link|topic_name)/i', $wakalaai_callback, $search_agent_wakalaai_intro);
+
+            if ($prompt['use_writer_template'] == '0') {
+                $writer_agent_main = $prompt['customize_writer_template'];
+            } else {
+                if ($prompt['writer_agent_template'] == '0') {
+                    $writer_agent_main = !empty($prompt['prompt_link_topic']) ? $template['topic_link_writer_main'] : $template['topic_name_writer_main'];
+                } else {
+                    $writer_agent_main = !empty($prompt['prompt_link_topic']) ? $template['topic_link_writer_global_main'] : $template['topic_name_writer_global_main'];
+                }
+            }
+            $writer_agent_main = preg_replace_callback('/#(Category|Country|City|Language|Link|topic_name)/i', $callback, $writer_agent_main);
+
+            if ($valid_prommpt) {
+                $time = time();
+                $result_exec = $conn->query("SELECT * FROM Wo_AI_Prompts_execution WHERE prompt_id='{$id}'");
+                
+                if (!mysqli_num_rows($result_exec)) {
+                    $attempts = 1;
+                    $conn->query("INSERT INTO Wo_AI_Prompts_execution SET prompt_id='{$id}',category='{$category}',language='{$language}',country='{$country}',topic_name='{$topic_name}',link_topic='{$link}',running_status=0,attempts=1,pending_date_time='{$time}' ");
+                } else {
+                    $result_exec_arr = $result_exec->fetch_assoc();
+                    $seconds_diff = $time - $result_exec_arr['pending_date_time'];
+                    if (($seconds_diff / 60) < 15) {
+                        echo 'repition';
+                        continue;
+                    }
+                    $attempts = $result_exec_arr['attempts'] + 1;
+                    $conn->query("UPDATE Wo_AI_Prompts_execution SET category='{$category}',attempts='{$attempts}',running_status = 0,language='{$language}',country='{$country}',topic_name='{$topic_name}',link_topic='{$link}',pending_date_time='{$time}' WHERE prompt_id='{$id}'");
+                }
+
+                try {
+                    $prompt_id = $id;
+                    if ($prompt_search_engine != 'perplexity_search') {
+                        require_once('openai_automation_search.php');
+                    } else {
+                        $answer = '';
+                        $error_message = '';
+                        try {
+                            $query = '';
+                            if (!empty($expected_time)) {
+                                $prompt_since = 'from';
+                                if ($frequency == 'minutes') {
+                                    $sec = 600;
+                                } else if ($frequency == 'hours') {
+                                    $sec = 10800;
+                                } else {
+                                    $sec = 3600;
+                                }
+                                $last_executed_str = $prompt['time'] + $sec;
+                                $prompt_date = date('d-m-Y H:i A', $last_executed_str);
+                                $query = $query . ' ' . $prompt_since . ' ' . $prompt_date . ' UTC';
+
+                                if (strpos($replacedPrompt, 'focus on the latest results') !== false && $prompt['status'] == '1') {
+                                    $replacedPrompt = str_replace('focus on the latest results', 'focus on the latest results ' . $query, $replacedPrompt);
+                                }
+                                if (strpos($search_agent_intro, 'focus on the latest results') !== false && $prompt['status'] == '1') {
+                                    $search_agent_intro = str_replace('focus on the latest results', 'focus on the latest results ' . $query, $search_agent_intro);
+                                }
+                                if (strpos($search_agent_wakalaai_intro, 'focus on the latest results') !== false && $prompt['status'] == '1') {
+                                    $search_agent_wakalaai_intro = str_replace('focus on the latest results', 'focus on the latest results ' . $query, $search_agent_wakalaai_intro);
+                                }
+                                if (strpos($writer_agent_main, 'focus on the latest results') !== false && $prompt['status'] == '1') {
+                                    $writer_agent_main = str_replace('focus on the latest results', 'focus on the latest results ' . $query, $writer_agent_main);
+                                }
+
+                                $search_agent_intro = str_replace('#SINCE#', $query, $search_agent_intro);
+                                $search_agent_wakalaai_intro = str_replace('#SINCE#', $query, $search_agent_wakalaai_intro);
+                                $writer_agent_main = str_replace('#SINCE#', $query, $writer_agent_main);
+                            } else {
+                                $prompt_since = 'from';
+                                $sec = ($frequency == 'minutes') ? 600 : (($frequency == 'hours') ? 10800 : 3600);
+                                $last_executed_str = $prompt['time'] + $sec;
+                                $prompt_date = date('d-m-Y H:i A', $last_executed_str);
+                                $query = $query . ' ' . $prompt_since . ' ' . $prompt_date;
+                                $search_agent_intro = str_replace('#SINCE#', $query, $search_agent_intro);
+                                $search_agent_wakalaai_intro = str_replace('#SINCE#', $query, $search_agent_wakalaai_intro);
+                                $writer_agent_main = str_replace('#SINCE#', $query, $writer_agent_main);
+                            }
+
+                            $country_sql = $conn->query("SELECT * FROM Wo_Country_Timezones_Gmt WHERE country='{$country}' ");
+                            if (mysqli_num_rows($country_sql)) {
+                                $country_sql_fetch = $country_sql->fetch_assoc();
+                                $date = new DateTime("now", new DateTimeZone($country_sql_fetch['timezone']));
+                                $datetime = $date->format('d-m-Y h:i A') . ' ' . $country_sql_fetch['gmt'];
+                            } else {
+                                $datetime = date('d-m-Y H:i A', $last_executed_str);
+                            }
+                            $search_agent_wakalaai_intro = str_replace('{{current_datetime}}', $datetime, $search_agent_wakalaai_intro);
+
+                            $domain = "[]";
+                            if (!empty($prompt_site_filter)) {
+                                $include_domains = explode(",", $prompt_site_filter);
+                                $domain = '["' . implode('","', $include_domains) . '"]';
+                            }
+
+                            $search_sql = $conn->query("SELECT * FROM Wo_AI_Prompts_Knowledge_Search WHERE PromptID='{$id}' AND language='{$language}' ");
+                            if (mysqli_num_rows($search_sql)) {
+                                $sql_fetch = $search_sql->fetch_assoc();
+                                if ($sql_fetch['postpone_cron'] > 0) {
+                                    $postpone_cron = $sql_fetch['postpone_cron'] - 1;
+                                    $conn->query("UPDATE Wo_AI_Prompts_Knowledge_Search SET postpone_cron = '{$postpone_cron}' WHERE PromptID='{$id}' AND language='{$language}' ");
+                                    echo 'postponed';
+                                    continue;
+                                }
+                            }
+
+                            $search_agent_instruction = !empty($prompt['prompt_link_topic']) ? $template['topic_link_search_instruction'] : $template['topic_name_search_instruction'];
+                            $search_agent_intro = trim(preg_replace('/\s\s+/', ' ', $search_agent_intro));
+                            $httpcode = 400;
+
+                            if ($enable_wakalaai_search == '1') {
+                                $wakalaai_api_key = $env['WAKALAAI_SEARCH_API_KEY'];
+                                $curl = curl_init();
+                                curl_setopt_array($curl, [
+                                    CURLOPT_URL => 'https://wakalaai.com/api/v1/prediction/5fee7b92-0744-4098-9b91-db36cde20f58',
+                                    CURLOPT_RETURNTRANSFER => true,
+                                    CURLOPT_CUSTOMREQUEST => 'POST',
+                                    CURLOPT_POSTFIELDS => ['question' => $search_agent_wakalaai_intro],
+                                    CURLOPT_HTTPHEADER => ['Authorization: ' . $wakalaai_api_key],
+                                ]);
+                                $response = curl_exec($curl);
+                                $response_arr = json_decode($response, true);
+                                $httpcode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+                                curl_close($curl);
+                            }
+
+                            if ((isset($response_arr['text']) && $response_arr['text'] == 'Agent stopped due to max iterations.') || $httpcode != 200 || $enable_wakalaai_search == '0') {
+                                $curl = curl_init();
+                                curl_setopt_array($curl, [
+                                    CURLOPT_URL => 'https://api.perplexity.ai/chat/completions',
+                                    CURLOPT_RETURNTRANSFER => true,
+                                    CURLOPT_CUSTOMREQUEST => 'POST',
+                                    CURLOPT_POSTFIELDS => json_encode([
+                                        "model" => $perplexity_models,
+                                        "messages" => [
+                                            ["role" => "system", "content" => $search_agent_instruction],
+                                            ["role" => "user", "content" => $search_agent_intro]
+                                        ],
+                                        "max_tokens" => 800,
+                                        "temperature" => 0.15,
+                                        "top_p" => 0.8,
+                                        "return_citations" => false,
+                                        "search_recency_filter" => "day"
+                                    ]),
+                                    CURLOPT_HTTPHEADER => [
+                                        'Authorization: Bearer ' . $perplexity_search_api_key,
+                                        'Content-Type: application/json'
+                                    ],
+                                ]);
+                                $response = curl_exec($curl);
+                                curl_close($curl);
+                                $json = json_decode($response, true);
+                                $answer = $json['choices'][0]['message']['content'] ?? 'No result found.';
+                            } else {
+                                $answer = $response_arr['text'];
+                            }
+
+                            $answer = trim(preg_replace('/\[[^\]]*\]/', '', $answer));
+                            $answer = trim(str_replace(["**", "###", "'", "’", '"', "\n", "\r"], "`", $answer));
+                            $time = time();
+
+                            $foundresult = 1;
+                            $answerLower = strtolower($answer);
+                            if (strpos($answerLower, 'foundresult') !== false) {
+                                if (preg_match('/foundresult:?\s*([01])/', $answerLower, $matches)) {
+                                    $foundresult = $matches[1];
+                                }
+                            }
+
+                            $answer = preg_replace('/foundresult:?\s*[01]/i', '', $answer);
+                            $answer = trim($answer);
+
+                            $sports_products = '';
+                            if (strpos($answer, 'Sports Products') !== false) {
+                                $start = strpos($answer, 'Sports Products');
+                                $sports_products = substr($answer, $start);
+                                $sports_products = str_replace(["Sports Products", ":", "*", "#"], "", $sports_products);
+                                $answer = str_replace($sports_products, "", $answer);
+                                $answer = str_replace(['Sports Products', '::', '##'], "", $answer);
+                            }
+
+                            if ($foundresult < 1) {
+                                $answer = 'No result found';
+                                $conn->query("UPDATE Wo_AI_Prompts_execution SET attempts='{$attempts}' WHERE prompt_id='{$id}' ");
+                                $conn->query("UPDATE Wo_AI_Automation_Prompts SET status = '3', time='{$time}' WHERE id='{$id}' ");
+                            }
+
+                            $search_sql = $conn->query("SELECT * FROM Wo_AI_Prompts_Knowledge_Search WHERE PromptID='{$id}' AND language='{$language}' ");
+                            if (!mysqli_num_rows($search_sql)) {
+                                $conn->query("INSERT INTO Wo_AI_Prompts_Knowledge_Search SET Result1 = '{$answer}', Result1_timestamp='{$time}', PromptID='{$id}', language='{$language}', country='{$country}', sports_products_param = '{$sports_products}', sports_products_deal = '0' ");
+                            } else {
+                                $sql_fetch = $search_sql->fetch_assoc();
+                                if ($sql_fetch['Result1_timestamp'] > $sql_fetch['Result2_timestamp']) {
+                                    $older = $sql_fetch['Result1'];
+                                    $result1Arr = explode(" ", strtolower($sql_fetch['Result1']));
+                                    $result2Arr = explode(" ", strtolower($answer));
+                                    $conn->query("UPDATE Wo_AI_Prompts_Knowledge_Search SET Result2 = '{$answer}', Result2_timestamp='{$time}', country='{$country}' WHERE PromptID='{$id}' AND language='{$language}' ");
+                                } else {
+                                    $older = $sql_fetch['Result2'];
+                                    $result1Arr = explode(" ", strtolower($answer));
+                                    $result2Arr = explode(" ", strtolower($sql_fetch['Result2']));
+                                    $conn->query("UPDATE Wo_AI_Prompts_Knowledge_Search SET Result1 = '{$answer}', Result1_timestamp='{$time}', country='{$country}' WHERE PromptID='{$id}' AND language='{$language}' ");
+                                }
+                                
+                                $conn->query("UPDATE Wo_AI_Prompts_Knowledge_Search SET sports_products_param = '{$sports_products}', sports_products_deal = '0' WHERE PromptID='{$id}' AND language='{$language}' ");
+
+                                if ($foundresult < 1) {
+                                    echo "No result found";
+                                    continue;
+                                }
+
+                                if ($older != 'No result found') {
+                                    $match_words = 0;
+                                    $total_valid_words = 0;
+                                    foreach ($result1Arr as $word) {
+                                        if (strlen($word) >= 4) {
+                                            $total_valid_words++;
+                                            if (in_array($word, $result2Arr)) {
+                                                $match_words++;
+                                            }
+                                        }
+                                    }
+                                    $perc = $total_valid_words > 0 ? (int)(($match_words * 100) / $total_valid_words) : 0;
+                                    $conn->query("UPDATE Wo_AI_Prompts_Knowledge_Search SET matching_percentage = '{$perc}' WHERE PromptID='{$id}' AND language='{$language}' ");
+
+                                    if ($perc > $prompt_matching_result) {
+                                        $conn->query("UPDATE Wo_AI_Automation_Prompts SET status = '4', time='{$time}' WHERE id='{$id}' ");
+                                        $conn->query("UPDATE Wo_AI_Prompts_Knowledge_Search SET postpone_cron = '1' WHERE PromptID='{$id}' AND language='{$language}' ");
+                                        echo "Already exisits";
+                                        continue;
+                                    }
+                                }
+                            }
+                        } catch (Exception $e) {
+                            $data['message'] = "Error: " . $e->getMessage();
+                        }
+                    }
+                } catch (Exception $e) {
+                    $data['message'] = "Error: " . $e->getMessage();
+                    $data['message_type'] = "danger";
+                    $_SESSION['message'][$id] = "Error: " . $e->getMessage() . " for ID " . $id;
+                    $_SESSION['message_type'][$id] = "danger";
+                }
+            }
+        } else {
+            $data['message'] = "Error: Prompt not found!";
+            $data['message_type'] = "danger";
+            $_SESSION['message'][$id] = "Error: Prompt not found! for ID " . $id;
+            $_SESSION['message_type'][$id] = "danger";
+        }
+    }
+
+    $result_exec = $conn->query("SELECT * FROM Wo_AI_Prompts_execution WHERE running_status = 0");
+    if (!mysqli_num_rows($result_exec)) {
+        $conn->query("TRUNCATE TABLE Wo_AI_Prompts_execution");
+    }
+
+    echo json_encode($data);
+}
